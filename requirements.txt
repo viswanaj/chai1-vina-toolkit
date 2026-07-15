@@ -1,0 +1,27 @@
+# Core (always needed)
+numpy
+pandas
+rdkit
+gemmi
+requests
+
+# Structure prediction (predict_structures.py, affinity_boltz.py)
+# chai-lab
+# torch
+# boltz
+
+# Docking / ligand prep (predict_structures.py, dock_triage.py, dock_compare_structures.py)
+# vina
+# meeko
+
+# Pose-recovery validation (pose_recovery.py)
+# tmtools
+
+# Plotting (plotting.py, pocket_engagement.py --out-png)
+# matplotlib
+# seaborn
+# plotly
+
+# CLI-only tools used via subprocess, not pip-installable:
+#   obabel (openbabel)  — apt/brew/conda install openbabel
+#   fpocket             — conda install -c conda-forge fpocket, or brew install fpocket

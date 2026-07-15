@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chai1-vina-toolkit"
+version = "0.1.0"
+description = "Protein-agnostic Chai-1 co-folding + AutoDock Vina docking toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+    "pandas",
+    "rdkit",
+    "gemmi",
+    "requests",
+]
+
+[project.optional-dependencies]
+chai1 = ["chai-lab", "torch"]
+vina = ["vina", "meeko"]
+boltz = ["boltz"]
+posecheck = ["tmtools"]
+plotting = ["matplotlib", "seaborn", "plotly"]
+all = ["chai-lab", "torch", "vina", "meeko", "boltz", "tmtools", "matplotlib", "seaborn", "plotly"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

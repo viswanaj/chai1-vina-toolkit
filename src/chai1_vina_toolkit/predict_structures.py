@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 predict_structures.py — Chai-1 co-fold structure prediction + AutoDock Vina
-ΔG scoring for protein-ligand complexes.
+ΔG scoring for protein-ligand complexes, with optional ligand-free (apo)
+folding.
 
 For a given target (any protein sequence), loads a ligand list from a CSV,
-runs Chai-1 protein-ligand co-folding on each (target, ligand) pair, then
-scores the predicted pose with AutoDock Vina in score_only mode.
+runs Chai-1 co-folding on each (target, ligand) pair -- or on the target
+alone, for rows with a blank SMILES -- then scores the predicted pose with
+AutoDock Vina in score_only mode (skipped automatically for apo rows, since
+there's no ligand to dock).
 
 Input CSV schema
 -----------------
@@ -13,13 +16,47 @@ Input CSV schema
 
   `target_id` is any string identifier for the row's target — a UniProt
   accession is a natural choice but not required. Rows are filtered to
-  --target-id. `group` is a free-form label (e.g. "binder"/"decoy") used only
-  for organizing output directories and downstream reports.
+  --target-id. `group` is a free-form label (e.g. "binder"/"decoy"/"apo")
+  used only for organizing output directories and downstream reports.
+  Leave `smiles` blank for an apo (ligand-free) fold of the target alone.
 
 Outputs
 -------
-  <output-dir>/<group>/<molecule_id>/pred.model_idx_0.cif
-  <output-dir>/summary.csv   — confidence scores + ΔG per complex, written incrementally
+  <output-dir>/<group>/<molecule_id>/pred.model_idx_{0..4}.cif   -- all 5
+    diffusion samples chai-lab generates per complex (not just the top one)
+  <output-dir>/<group>/<molecule_id>/scores.model_idx_{0..4}.npz -- chai-lab's
+    own per-sample scores (aggregate_score, ptm, iptm, per_chain_ptm,
+    has_inter_chain_clashes, chain_chain_clashes)
+  <output-dir>/summary.csv -- one row per complex, written incrementally,
+    with the full metrics panel described below
+
+Metrics panel
+-------------
+Beyond the top-ranked sample's aggregate_score/ptm/iptm (chai-lab's own
+ranking), this also surfaces fields chai-lab computes but the original
+version of this script discarded, plus two derived cross-sample metrics:
+
+  per_chain_ptm            -- pTM for each chain, ';'-joined (top sample)
+  chain_chain_clashes      -- flattened inter/intra-chain clash-count matrix
+  has_inter_chain_clashes  -- True if ANY of the 5 samples has a clash
+  ptm_mean/std_across_samples, iptm_mean/std_across_samples
+                            -- spread across all 5 diffusion samples; large
+                               spread = low reproducibility, independent of
+                               the top sample's absolute score
+  ca_rmsd_mean_across_samples -- mean pairwise CA RMSD (Kabsch-superposed)
+                               across the 5 samples' receptor chain -- a
+                               structural (not just score-based) ensemble
+                               reproducibility signal
+  pocket_mean_plddt        -- mean per-atom pLDDT (top sample) restricted to
+                               --pocket-positions, if given
+
+For apo rows: iptm and aggregate_score are set blank, not zero. Chai-lab's
+ipTM/aggregate_score formulas are defined over chain-chain interfaces; with
+only one chain, ipTM degenerates to a meaningless 0 (there's no second chain
+for the "interface" term to be computed against), and aggregate_score
+inherits that degeneracy (0.2*ptm + 0.8*0 = 0.2*ptm). Reporting that as if
+it were a real score would misrepresent an apo fold as a bad complex. Use
+`ptm` (and pocket_mean_plddt) for apo fold-confidence instead.
 
 Dependencies (beyond the toolkit's own requirements.txt)
 ---------------------------------------------------------
@@ -32,22 +69,38 @@ Compute
 
 Usage
 -----
-  python -m chai1_vina_toolkit.predict_structures \
+  python -m chai1_vina_toolkit.predict_structures \\
       --uniprot O00144 --hits-csv my_ligands.csv --output-dir out/O00144
-  python -m chai1_vina_toolkit.predict_structures \
-      --sequence MSEQUENCE... --target-id my_target --hits-csv my_ligands.csv \
+  python -m chai1_vina_toolkit.predict_structures \\
+      --sequence MSEQUENCE... --target-id my_target --hits-csv my_ligands.csv \\
       --output-dir out/my_target --no-esm --dry-run
+  # apo fold: leave smiles blank for that row in --hits-csv
+  python -m chai1_vina_toolkit.predict_structures \\
+      --target-id my_target --fasta my_target.fasta --hits-csv apo_row.csv \\
+      --output-dir out/my_target_apo --pocket-positions 151,155,339
+
+NOTE ON TESTING: the apo-mode + full-metrics code below was written directly
+against chai-lab's `chai_lab/ranking/{rank,ptm,plddt,clashes}.py` source (field
+names/shapes confirmed by reading it), and the CIF-parsing/RMSD helpers were
+unit-tested standalone with synthetic coordinates. The GPU-dependent path as
+a whole (actually calling run_inference and reading its real output) has NOT
+been exercised end-to-end -- this machine has no CUDA GPU. Sanity-check the
+first real run's summary.csv (column values not just presence) before trusting
+a full batch.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import statistics
 import sys
 import tempfile
 import warnings
 from pathlib import Path
 
+import gemmi
+import numpy as np
 import torch
 from rdkit import Chem
 
@@ -55,7 +108,11 @@ from .sequences import add_sequence_args, resolve_sequence
 
 SUMMARY_FIELDS = [
     "target_id", "molecule_id", "smiles", "predicted_score", "rank", "group",
-    "aggregate_score", "ptm", "iptm", "delta_g_kcal_mol",
+    "is_apo", "aggregate_score", "ptm", "iptm", "delta_g_kcal_mol",
+    "per_chain_ptm", "has_inter_chain_clashes", "chain_chain_clashes",
+    "ptm_mean_across_samples", "ptm_std_across_samples",
+    "iptm_mean_across_samples", "iptm_std_across_samples",
+    "ca_rmsd_mean_across_samples", "pocket_mean_plddt", "n_samples",
 ]
 
 
@@ -88,6 +145,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip ESM embeddings (faster; use for smoke tests)")
     p.add_argument("--no-delta-g", action="store_true",
                    help="Skip AutoDock Vina ΔG scoring")
+    p.add_argument("--pocket-positions", default=None,
+                   help="Comma-separated 1-indexed receptor residue positions "
+                        "(matching the input sequence's own numbering) to "
+                        "average pLDDT over, e.g. --pocket-positions 151,155,339")
     p.add_argument("--dry-run", action="store_true",
                    help="Validate inputs and generate FASTAs without running "
                         "Chai-1 or Vina. Use to smoke-test the pipeline locally.")
@@ -97,6 +158,12 @@ def parse_args() -> argparse.Namespace:
             sys.exit("ERROR: pass --target-id (or --uniprot, used as the default target-id)")
         args.target_id = args.uniprot
     return args
+
+
+def parse_pocket_positions(raw: str | None) -> list[int] | None:
+    if not raw:
+        return None
+    return [int(x) for x in raw.split(",") if x.strip()]
 
 
 # ── Hits loading ──────────────────────────────────────────────────────────────
@@ -133,14 +200,22 @@ def run_chai1(
     smiles: str,
     out_dir: Path,
     args: argparse.Namespace,
-) -> dict:
+) -> None:
+    """Run Chai-1 inference, writing all 5 samples' CIF+npz to out_dir.
+    Doesn't return scores itself -- collect_full_metrics reads them back from
+    disk afterward, so cached and freshly-run complexes go through the same
+    metrics-extraction path."""
     from chai_lab.chai1 import run_inference
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    fasta_content = (
-        f">protein|name={target_name}\n{sequence}\n\n"
-        f">ligand|name={molecule_id}\n{smiles}\n"
-    )
+    is_apo = not smiles
+    if is_apo:
+        fasta_content = f">protein|name={target_name}\n{sequence}\n"
+    else:
+        fasta_content = (
+            f">protein|name={target_name}\n{sequence}\n\n"
+            f">ligand|name={molecule_id}\n{smiles}\n"
+        )
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".fasta", delete=False
@@ -149,7 +224,7 @@ def run_chai1(
         fasta_path = Path(fh.name)
 
     try:
-        candidates = run_inference(
+        run_inference(
             fasta_file=fasta_path,
             output_dir=out_dir,
             num_trunk_recycles=args.num_recycles,
@@ -161,13 +236,121 @@ def run_chai1(
     finally:
         fasta_path.unlink(missing_ok=True)
 
-    # chai-lab >=0.5 returns StructureCandidates (not a list); scores live in
-    # ranking_data[i] (SampleRanking) and ptm_scores (PTMScores).
-    rd = candidates.ranking_data[0]
+
+# ── Cross-sample structural metrics ──────────────────────────────────────────
+
+def _find_chain(model: gemmi.Model, chain_id: str = "A") -> gemmi.Chain:
+    for chain in model:
+        if chain.name == chain_id:
+            return chain
+    return model[0]
+
+
+def extract_ca_coords(cif_path: Path, chain_id: str = "A") -> np.ndarray:
+    st = gemmi.read_structure(str(cif_path))
+    chain = _find_chain(st[0], chain_id)
+    coords = []
+    for residue in chain:
+        for atom in residue:
+            if atom.name == "CA":
+                coords.append([atom.pos.x, atom.pos.y, atom.pos.z])
+                break
+    return np.array(coords)
+
+
+def kabsch_rmsd(p: np.ndarray, q: np.ndarray) -> float:
+    """RMSD between two (N,3) coordinate sets after optimal superposition."""
+    pc = p - p.mean(axis=0)
+    qc = q - q.mean(axis=0)
+    h = pc.T @ qc
+    u, _, vt = np.linalg.svd(h)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    corr = np.diag([1.0, 1.0, d])
+    r = vt.T @ corr @ u.T
+    p_rot = (r @ pc.T).T
+    diff = p_rot - qc
+    return float(np.sqrt((diff**2).sum() / len(p)))
+
+
+def mean_pairwise_ca_rmsd(cif_paths: list[Path], chain_id: str = "A") -> float | None:
+    if len(cif_paths) < 2:
+        return None
+    coord_sets = [extract_ca_coords(p, chain_id) for p in cif_paths]
+    lengths = {len(c) for c in coord_sets}
+    if len(lengths) != 1:
+        warnings.warn(
+            f"CA count mismatch across samples ({lengths}) -- skipping cross-sample RMSD"
+        )
+        return None
+    rmsds = [
+        kabsch_rmsd(coord_sets[i], coord_sets[j])
+        for i in range(len(coord_sets))
+        for j in range(i + 1, len(coord_sets))
+    ]
+    return statistics.mean(rmsds)
+
+
+def pocket_mean_bfactor(
+    cif_path: Path, positions: list[int] | None, chain_id: str = "A"
+) -> float | None:
+    if not positions:
+        return None
+    st = gemmi.read_structure(str(cif_path))
+    chain = _find_chain(st[0], chain_id)
+    position_set = set(positions)
+    vals = [
+        atom.b_iso
+        for residue in chain
+        if residue.seqid.num in position_set
+        for atom in residue
+    ]
+    if not vals:
+        warnings.warn(f"None of --pocket-positions found in {cif_path.name} chain {chain_id}")
+        return None
+    return statistics.mean(vals)
+
+
+def collect_full_metrics(
+    group_dir: Path, is_apo: bool, pocket_positions: list[int] | None
+) -> dict:
+    """Read every pred.model_idx_*.cif / scores.model_idx_*.npz already on
+    disk in group_dir (cached from a prior run, or just written) and compute
+    the full metrics panel. Returns {} if nothing is on disk yet."""
+    cif_paths = sorted(
+        group_dir.glob("pred.model_idx_*.cif"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
+    )
+    npz_paths = sorted(
+        group_dir.glob("scores.model_idx_*.npz"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
+    )
+    if not cif_paths or not npz_paths:
+        return {}
+
+    per_sample = [dict(np.load(p, allow_pickle=False)) for p in npz_paths]
+    ptm_vals = [float(np.atleast_1d(s["ptm"])[0]) for s in per_sample]
+    iptm_vals = [float(np.atleast_1d(s["iptm"])[0]) for s in per_sample]
+    top = per_sample[0]
+
     return {
-        "aggregate_score": float(rd.aggregate_score.item()),
-        "ptm":             float(rd.ptm_scores.complex_ptm.item()),
-        "iptm":            float(rd.ptm_scores.interface_ptm.item()),
+        "is_apo": is_apo,
+        "ptm": ptm_vals[0],
+        "iptm": "" if is_apo else iptm_vals[0],
+        "aggregate_score": "" if is_apo else float(np.atleast_1d(top["aggregate_score"])[0]),
+        "per_chain_ptm": ";".join(f"{v:.4f}" for v in np.atleast_1d(top["per_chain_ptm"])),
+        "has_inter_chain_clashes": bool(
+            any(np.atleast_1d(s["has_inter_chain_clashes"]).reshape(-1).any() for s in per_sample)
+        ),
+        "chain_chain_clashes": ";".join(
+            str(int(v)) for v in np.atleast_1d(top["chain_chain_clashes"]).reshape(-1)
+        ),
+        "ptm_mean_across_samples": statistics.mean(ptm_vals),
+        "ptm_std_across_samples": statistics.pstdev(ptm_vals),
+        "iptm_mean_across_samples": "" if is_apo else statistics.mean(iptm_vals),
+        "iptm_std_across_samples": "" if is_apo else statistics.pstdev(iptm_vals),
+        "ca_rmsd_mean_across_samples": mean_pairwise_ca_rmsd(cif_paths),
+        "pocket_mean_plddt": pocket_mean_bfactor(cif_paths[0], pocket_positions),
+        "n_samples": len(per_sample),
     }
 
 
@@ -176,9 +359,8 @@ def run_chai1(
 def compute_delta_g(cif_path: Path, smiles: str) -> float | None:
     try:
         import subprocess
-        import gemmi
+
         from meeko import MoleculePreparation, PDBQTWriterLegacy
-        from rdkit import Chem
         from rdkit.Chem import AllChem
         from vina import Vina
     except ImportError as e:
@@ -273,6 +455,7 @@ def compute_delta_g(cif_path: Path, smiles: str) -> float | None:
 
 def main() -> None:
     args = parse_args()
+    pocket_positions = parse_pocket_positions(args.pocket_positions)
 
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -309,9 +492,10 @@ def main() -> None:
     for group_name, group_rows in hits.items():
         for row in group_rows:
             mol_id = row["molecule_id"]
-            smiles_raw = row["smiles"]
-            smiles = desalt_smiles(smiles_raw)
-            if smiles != smiles_raw:
+            smiles_raw = row.get("smiles", "") or ""
+            is_apo = not smiles_raw.strip()
+            smiles = "" if is_apo else desalt_smiles(smiles_raw)
+            if not is_apo and smiles != smiles_raw:
                 print(f"\n  [{group_name}] {mol_id}  desalted: {smiles_raw[:40]}… → {smiles[:40]}")
 
             if mol_id in seen_mol_ids:
@@ -327,67 +511,58 @@ def main() -> None:
             group_dir.mkdir(parents=True, exist_ok=True)
 
             score_display = row.get("predicted_score", "")
-            print(f"\n  [{group_name}] {mol_id}  score={score_display}")
+            label = "apo (no ligand)" if is_apo else smiles
+            print(f"\n  [{group_name}] {mol_id}  score={score_display}  {label}")
 
-            fasta_content = (
-                f">protein|name={target_name}\n{sequence}\n\n"
-                f">ligand|name={mol_id}\n{smiles}\n"
-            )
-
+            metrics: dict = {}
+            delta_g = None
             if args.dry_run:
+                fasta_content = (
+                    f">protein|name={target_name}\n{sequence}\n"
+                    if is_apo
+                    else f">protein|name={target_name}\n{sequence}\n\n>ligand|name={mol_id}\n{smiles}\n"
+                )
                 fasta_path = group_dir / "input.fasta"
                 fasta_path.write_text(fasta_content)
                 print(f"    [dry-run] FASTA written to {fasta_path}")
-                print(f"    [dry-run] SMILES: {smiles}")
-                chai_scores = {"aggregate_score": None, "ptm": None, "iptm": None}
-                delta_g = None
+                print(f"    [dry-run] {'apo, no ligand' if is_apo else f'SMILES: {smiles}'}")
             else:
-                cif_done = group_dir / "pred.model_idx_0.cif"
-                npz_done = group_dir / "scores.model_idx_0.npz"
-                if cif_done.exists() and npz_done.exists():
-                    import numpy as np
-                    d = np.load(npz_done)
-                    chai_scores = {
-                        "aggregate_score": float(d["aggregate_score"][0]),
-                        "ptm":             float(d["ptm"][0]),
-                        "iptm":            float(d["iptm"][0]),
-                    }
-                    print(f"    Chai-1 (cached) iptm={chai_scores['iptm']:.3f}  "
-                          f"ptm={chai_scores['ptm']:.3f}")
-                else:
+                metrics = collect_full_metrics(group_dir, is_apo, pocket_positions)
+                cache_label = "cached"
+                if not metrics:
+                    cache_label = "fresh"
                     try:
-                        chai_scores = run_chai1(
-                            target_name, sequence, mol_id, smiles, group_dir, args
-                        )
-                        print(f"    Chai-1 iptm={chai_scores['iptm']:.3f}  "
-                              f"ptm={chai_scores['ptm']:.3f}")
+                        run_chai1(target_name, sequence, mol_id, smiles, group_dir, args)
+                        metrics = collect_full_metrics(group_dir, is_apo, pocket_positions)
                     except Exception as exc:
                         warnings.warn(f"Chai-1 failed for {mol_id}: {exc}")
-                        chai_scores = {"aggregate_score": None, "ptm": None, "iptm": None}
+                        metrics = {}
 
-                delta_g = None
-                if not args.no_delta_g:
-                    cif_candidates = list(group_dir.glob("pred.model_idx_0.cif"))
-                    if cif_candidates:
-                        delta_g = compute_delta_g(cif_candidates[0], smiles)
+                if metrics:
+                    iptm_display = "n/a (apo)" if is_apo else f"{metrics['iptm']:.3f}"
+                    print(f"    Chai-1 ({cache_label}) ptm={metrics['ptm']:.3f}  iptm={iptm_display}")
+
+                if not is_apo and not args.no_delta_g and metrics:
+                    cif0 = group_dir / "pred.model_idx_0.cif"
+                    if cif0.exists():
+                        delta_g = compute_delta_g(cif0, smiles)
                         if delta_g is not None:
                             print(f"    ΔG = {delta_g:.2f} kcal/mol")
                         else:
                             print("    ΔG scoring failed (see warning above)")
                     else:
                         warnings.warn(f"No CIF found in {group_dir} — skipping ΔG")
+                metrics["delta_g_kcal_mol"] = delta_g if delta_g is not None else ""
 
             result = {
-                "target_id":        args.target_id,
-                "molecule_id":      mol_id,
-                "smiles":           smiles,
-                "predicted_score":  row.get("predicted_score", ""),
-                "rank":             row.get("rank", ""),
-                "group":            group_name,
-                "aggregate_score":  chai_scores["aggregate_score"] or "",
-                "ptm":              chai_scores["ptm"] or "",
-                "iptm":             chai_scores["iptm"] or "",
-                "delta_g_kcal_mol": delta_g if delta_g is not None else "",
+                "target_id":       args.target_id,
+                "molecule_id":     mol_id,
+                "smiles":          smiles,
+                "predicted_score": row.get("predicted_score", ""),
+                "rank":            row.get("rank", ""),
+                "group":           group_name,
+                **{k: metrics.get(k, "") for k in SUMMARY_FIELDS if k not in
+                   ("target_id", "molecule_id", "smiles", "predicted_score", "rank", "group")},
             }
             writer.writerow(result)
             summary_fh.flush()
@@ -397,23 +572,23 @@ def main() -> None:
     print(f"\n── Done. {len(completed)} complexes scored ──")
     print(f"  Summary: {summary_csv}\n")
 
-    has_dg = any(r["delta_g_kcal_mol"] != "" for r in completed)
-    sort_key = "delta_g_kcal_mol" if has_dg else "iptm"
+    has_dg = any(r.get("delta_g_kcal_mol") not in ("", None) for r in completed)
+    sort_key = "delta_g_kcal_mol" if has_dg else "ptm"
     rev = not has_dg
     ranked = sorted(
         completed,
-        key=lambda r: float(r[sort_key]) if r[sort_key] != "" else float("inf"),
+        key=lambda r: float(r[sort_key]) if r.get(sort_key) not in ("", None) else float("inf"),
         reverse=rev,
     )
-    hdr = f"{'Mol':16} {'Group':12} {'Score':>7} {'ipTM':>6} {'ΔG (kcal/mol)':>14}"
+    hdr = f"{'Mol':16} {'Group':8} {'apo':>5} {'pTM':>6} {'ipTM':>6} {'ΔG (kcal/mol)':>14}"
     print(hdr)
     print("-" * len(hdr))
     for r in ranked:
-        dg = f"{float(r['delta_g_kcal_mol']):>14.2f}" if r["delta_g_kcal_mol"] != "" else f"{'—':>14}"
-        iptm = f"{float(r['iptm']):>6.3f}" if r["iptm"] != "" else f"{'—':>6}"
-        score = float(r["predicted_score"]) if r["predicted_score"] not in ("", None) else float("nan")
-        print(f"{r['molecule_id']:16} {r['group']:12} {score:>7.1f} "
-              f"{iptm} {dg}")
+        dg = f"{float(r['delta_g_kcal_mol']):>14.2f}" if r.get("delta_g_kcal_mol") not in ("", None) else f"{'—':>14}"
+        ptm = f"{float(r['ptm']):>6.3f}" if r.get("ptm") not in ("", None) else f"{'—':>6}"
+        iptm = f"{float(r['iptm']):>6.3f}" if r.get("iptm") not in ("", None) else f"{'—':>6}"
+        apo_flag = str(r.get("is_apo", ""))[:5]
+        print(f"{r['molecule_id']:16} {r['group']:8} {apo_flag:>5} {ptm} {iptm} {dg}")
 
 
 if __name__ == "__main__":
